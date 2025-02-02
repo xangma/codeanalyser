@@ -53,7 +53,7 @@ The final output is a JSON file containing two keys:
 
 ## Installation
 
-1. Clone or download the repository containing the `analyze_and_snapshot.py` script.
+1. Clone or download the repository containing the `codeanalyser.py` script.
 2. Install the required dependencies:
    ```bash
    pip install psutil
@@ -66,7 +66,7 @@ The final output is a JSON file containing two keys:
 Run the script from the command line using the following syntax:
 
 ```bash
-./analyze_and_snapshot.py path/to/target_script.py output.json [--timeout 10] [--include-source] [--filter-file substring [substring ...]] [--filter-name substring [substring ...]]
+./codeanalyser.py path/to/target_script.py output.json [--timeout 10] [--include-source] [--filter-file substring [substring ...]] [--filter-name substring [substring ...]]
 ```
 
 ### Arguments
