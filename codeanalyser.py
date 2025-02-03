@@ -11,7 +11,7 @@ JSON output contains two keys:
                          of function names where the variable appears.
 
 Usage:
-    ./analyze_and_snapshot.py path/to/target_script.py output.json [--timeout 10] [--include-source]
+    ./codeanalyser.py path/to/target_script.py output.json [--timeout 10] [--include-source]
          [--filter-file substring [substring ...]] [--filter-name substring [substring ...]]
 
 The --include-source flag (default off) controls whether to include source code snippets for each function/method.
@@ -48,6 +48,7 @@ SELF_PATH = os.path.abspath(__file__)
 # Code mapping functions
 # =============================================================================
 
+
 def extract_function_source(filepath, target_lineno, target_name):
     """
     Given a file path and the starting line number for a function,
@@ -76,7 +77,8 @@ def extract_function_source(filepath, target_lineno, target_name):
                 # Fallback heuristic: capture until indent decreases.
                 lines = source.splitlines()
                 start_line = node.lineno - 1
-                base_indent = len(lines[start_line]) - len(lines[start_line].lstrip())
+                base_indent = len(lines[start_line]) - \
+                    len(lines[start_line].lstrip())
                 snippet_lines = [lines[start_line]]
                 for l in lines[start_line+1:]:
                     if l.strip() == "":
@@ -88,6 +90,7 @@ def extract_function_source(filepath, target_lineno, target_name):
                     snippet_lines.append(l)
                 return "\n".join(snippet_lines)
     return None
+
 
 def get_function_signature(node):
     """
@@ -102,12 +105,15 @@ def get_function_signature(node):
         args.append("**" + node.args.kwarg.arg)
     return "(" + ", ".join(args) + ")"
 
+
 class CallCollector(ast.NodeVisitor):
     """
     Walks through a function/method body and collects function calls.
     """
+
     def __init__(self):
         self.calls = []
+
     def visit_Call(self, node):
         func_name = None
         if isinstance(node.func, ast.Name):
@@ -125,6 +131,7 @@ class CallCollector(ast.NodeVisitor):
             self.calls.append(func_name)
             self.calls = list(set(self.calls))
         self.generic_visit(node)
+
 
 def build_codemap(file_path, include_source=False):
     """
@@ -160,7 +167,8 @@ def build_codemap(file_path, include_source=False):
             collector.visit(node)
             func_info["calls"] = collector.calls
             if include_source:
-                func_info["source_code"] = extract_function_source(file_path, node.lineno, node.name)
+                func_info["source_code"] = extract_function_source(
+                    file_path, node.lineno, node.name)
             codemap["functions"].append(func_info)
         elif isinstance(node, ast.ClassDef):
             class_info = {
@@ -181,10 +189,12 @@ def build_codemap(file_path, include_source=False):
                     collector.visit(item)
                     method_info["calls"] = collector.calls
                     if include_source:
-                        method_info["source_code"] = extract_function_source(file_path, item.lineno, item.name)
+                        method_info["source_code"] = extract_function_source(
+                            file_path, item.lineno, item.name)
                     class_info["methods"].append(method_info)
             codemap["classes"].append(class_info)
     return codemap
+
 
 def build_directory_codemap(target_script, include_source=False):
     """
@@ -193,7 +203,7 @@ def build_directory_codemap(target_script, include_source=False):
     Also, skip this analyzer’s own file.
     """
     directory = os.path.dirname(os.path.abspath(target_script))
-    
+
     # If pathspec is available, try to load the .gitignore from the repository root (assumed to be 'directory').
     gitignore_spec = None
     if pathspec is not None:
@@ -202,7 +212,8 @@ def build_directory_codemap(target_script, include_source=False):
             try:
                 with open(gitignore_file, "r", encoding="utf-8") as f:
                     gitignore_lines = f.read().splitlines()
-                gitignore_spec = pathspec.PathSpec.from_lines("gitwildmatch", gitignore_lines)
+                gitignore_spec = pathspec.PathSpec.from_lines(
+                    "gitwildmatch", gitignore_lines)
             except Exception as e:
                 print(f"Error reading .gitignore: {e}")
 
@@ -221,13 +232,15 @@ def build_directory_codemap(target_script, include_source=False):
                     print(f"Skipping {relative_path} (matches .gitignore)")
                     continue
                 print(f"Mapping file: {full_path}")
-                codemap = build_codemap(full_path, include_source=include_source)
+                codemap = build_codemap(
+                    full_path, include_source=include_source)
                 codemaps.append(codemap)
     return codemaps
 
 # =============================================================================
 # Snapshot functions (consolidated variable examples)
 # =============================================================================
+
 
 def sanitize_for_json(obj, seen=None):
     """
@@ -261,15 +274,51 @@ def sanitize_for_json(obj, seen=None):
         except Exception:
             return repr(obj)
 
+
+def is_sensitive_variable(var_name):
+    """
+    Determine if a variable name is likely to contain a password.
+    """
+    lower = var_name.lower()
+    return any(keyword in lower for keyword in ["password", "passwd", "pwd"])
+
+
+def filter_sensitive_data(obj):
+    """
+    Recursively traverse an object and replace values for any keys that appear to be sensitive.
+    If a key name indicates sensitive information (e.g. contains 'password'),
+    its value is replaced with a placeholder.
+    """
+    if isinstance(obj, dict):
+        new_obj = {}
+        for k, v in obj.items():
+            if is_sensitive_variable(str(k)):
+                new_obj[k] = "***REDACTED***"
+            else:
+                new_obj[k] = filter_sensitive_data(v)
+        return new_obj
+    elif isinstance(obj, list):
+        return [filter_sensitive_data(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(filter_sensitive_data(item) for item in obj)
+    elif isinstance(obj, set):
+        return {filter_sensitive_data(item) for item in obj}
+    else:
+        return obj
+
+
 def safe_snapshot_value(value):
     """
-    Try to convert a value for snapshotting; if not possible, return its repr().
+    Try to convert a value for snapshotting; if successful, filter any sensitive data.
+    If not possible, return its repr().
     """
     try:
+        # Check JSON serializability.
         json.dumps(value)
-        return value
+        return filter_sensitive_data(value)
     except Exception:
         return repr(value)
+
 
 def snapshot_main_process():
     """
@@ -293,6 +342,9 @@ def snapshot_main_process():
             for var, value in current.f_locals.items():
                 if var in ["args", "snapshot_vars"]:
                     continue
+                # Skip variables that appear to be passwords.
+                if is_sensitive_variable(var):
+                    continue
                 try:
                     example = safe_snapshot_value(value[:LIMIT])
                 except Exception:
@@ -303,12 +355,14 @@ def snapshot_main_process():
                 if var in snapshot_vars:
                     snapshot_vars[var]["functions"].add(func_name)
                 else:
-                    snapshot_vars[var] = {"example": example, "functions": set([func_name])}
+                    snapshot_vars[var] = {
+                        "example": example, "functions": set([func_name])}
             current = current.f_back
     # Convert sets to lists for JSON serialization.
     for var in snapshot_vars:
         snapshot_vars[var]["functions"] = list(snapshot_vars[var]["functions"])
     return snapshot_vars
+
 
 def snapshot_signal_handler(signum, frame):
     """
@@ -332,6 +386,9 @@ def snapshot_signal_handler(signum, frame):
             for var, value in current.f_locals.items():
                 if var in ["args", "snapshot_vars"]:
                     continue
+                # Skip variables that appear to be passwords.
+                if is_sensitive_variable(var):
+                    continue
                 try:
                     example = safe_snapshot_value(value[:LIMIT])
                 except Exception:
@@ -342,7 +399,8 @@ def snapshot_signal_handler(signum, frame):
                 if var in snapshot_vars:
                     snapshot_vars[var]["functions"].add(func_name)
                 else:
-                    snapshot_vars[var] = {"example": example, "functions": set([func_name])}
+                    snapshot_vars[var] = {
+                        "example": example, "functions": set([func_name])}
             current = current.f_back
     for var in snapshot_vars:
         snapshot_vars[var]["functions"] = list(snapshot_vars[var]["functions"])
@@ -354,11 +412,14 @@ def snapshot_signal_handler(signum, frame):
     except Exception as e:
         print(f"[Worker {os.getpid()}] Error writing snapshot: {e}")
 
+
 # --- Monkey-patch ProcessPoolExecutor so workers install our snapshot initializer ---
 OriginalProcessPoolExecutor = concurrent.futures.ProcessPoolExecutor
 
+
 def process_pool_initializer():
     signal.signal(signal.SIGUSR1, snapshot_signal_handler)
+
 
 class PatchedProcessPoolExecutor(OriginalProcessPoolExecutor):
     def __init__(self, *args, **kwargs):
@@ -366,7 +427,9 @@ class PatchedProcessPoolExecutor(OriginalProcessPoolExecutor):
             kwargs['initializer'] = process_pool_initializer
         super().__init__(*args, **kwargs)
 
+
 concurrent.futures.ProcessPoolExecutor = PatchedProcessPoolExecutor
+
 
 def trigger_worker_snapshots():
     """
@@ -380,6 +443,7 @@ def trigger_worker_snapshots():
             print(f"Sent SIGUSR1 to worker process {child.pid}")
         except Exception as e:
             print(f"Failed to send SIGUSR1 to process {child.pid}: {e}")
+
 
 def collect_worker_snapshots():
     """
@@ -402,6 +466,7 @@ def collect_worker_snapshots():
             print(f"Error reading worker snapshot from {filename}: {e}")
     return worker_snapshots
 
+
 def merge_snapshots(main_snapshot, worker_snapshots):
     """
     Merge the main process snapshot with all worker snapshots.
@@ -411,11 +476,13 @@ def merge_snapshots(main_snapshot, worker_snapshots):
     for worker, snapshot in worker_snapshots.items():
         for var, info in snapshot.items():
             if var in consolidated:
-                consolidated[var]["functions"] = list(set(consolidated[var]["functions"]).union(set(info["functions"])))
+                consolidated[var]["functions"] = list(
+                    set(consolidated[var]["functions"]).union(set(info["functions"])))
                 # Optionally, keep the main snapshot's example.
             else:
                 consolidated[var] = info
     return consolidated
+
 
 def run_target_program(file_path):
     """
@@ -426,14 +493,15 @@ def run_target_program(file_path):
         sys.path.insert(0, target_dir)
     runpy.run_path(file_path, run_name="__main__")
 
+
 def run_with_snapshot(file_path, timeout=10):
     """
-    Run the target program in a separate thread and, after a delay, take snapshots of the main process
-    and any worker processes. Then merge them into a consolidated snapshot mapping variable names to
-    an example value and a list of function names where the variable appears.
+    Run the target program in a separate daemon thread so that if it never terminates
+    (as with a Dash server), our snapshot logic can still complete and the analyzer can exit.
     """
-    
-    target_thread = threading.Thread(target=run_target_program, args=(file_path,))
+    # Set daemon=True so the thread won't block process exit.
+    target_thread = threading.Thread(
+        target=run_target_program, args=(file_path,), daemon=True)
     target_thread.start()
 
     print(f"Waiting {timeout} seconds before taking a snapshot...")
@@ -446,12 +514,14 @@ def run_with_snapshot(file_path, timeout=10):
     worker_snapshots = collect_worker_snapshots()
 
     consolidated_snapshot = merge_snapshots(main_snapshot, worker_snapshots)
-    target_thread.join()
+
+    # No need to join the daemon thread since it won't block exit.
     return consolidated_snapshot
 
 # =============================================================================
 # Filtering functions for codemap and variable examples
 # =============================================================================
+
 
 def filter_codemap(codemaps, file_filters=None, name_filters=None):
     """
@@ -467,12 +537,14 @@ def filter_codemap(codemaps, file_filters=None, name_filters=None):
         pwd = os.getcwd()
         filtered_functions = []
         filtered_classes = []
-        file_filters = [os.path.abspath(os.path.join(pwd, filt)) for filt in file_filters] if file_filters else []
+        file_filters = [os.path.abspath(os.path.join(
+            pwd, filt)) for filt in file_filters] if file_filters else []
         file_path = entry.get("file", "")
         # Determine if the file name matches any file filter (if provided)
         file_matches = False
         if file_filters:
-            file_matches = any(filt.lower() in file_path.lower() for filt in file_filters)
+            file_matches = any(filt.lower() in file_path.lower()
+                               for filt in file_filters)
 
         # If name_filters is provided, filter functions and classes accordingly.
         if name_filters:
@@ -480,7 +552,8 @@ def filter_codemap(codemaps, file_filters=None, name_filters=None):
                                   if any(nf.lower() in f.get("name", "").lower() for nf in name_filters)]
             filtered_classes = []
             for cls in entry.get("classes", []):
-                class_matches = any(nf.lower() in cls.get("name", "").lower() for nf in name_filters)
+                class_matches = any(nf.lower() in cls.get(
+                    "name", "").lower() for nf in name_filters)
                 methods = cls.get("methods", [])
                 filtered_methods = [m for m in methods
                                     if any(nf.lower() in m.get("name", "").lower() for nf in name_filters)]
@@ -502,6 +575,7 @@ def filter_codemap(codemaps, file_filters=None, name_filters=None):
             filtered_codemap.append(new_entry)
     return filtered_codemap
 
+
 def filter_variable_examples(variable_examples, name_filters=None):
     """
     Given a mapping of variable names to their snapshot info (which includes a list of function names),
@@ -513,21 +587,26 @@ def filter_variable_examples(variable_examples, name_filters=None):
     filtered = {}
     for var, info in variable_examples.items():
         funcs = info.get("functions", [])
-        filtered_funcs = [fn for fn in funcs if any(nf.lower() in fn.lower() for nf in name_filters)]
+        filtered_funcs = [fn for fn in funcs if any(
+            nf.lower() in fn.lower() for nf in name_filters)]
         if filtered_funcs:
-            filtered[var] = {"example": info["example"], "functions": filtered_funcs}
+            filtered[var] = {"example": info["example"],
+                             "functions": filtered_funcs}
     return filtered
 
 # =============================================================================
 # Main: combine directory codemap and consolidated variable snapshots into one JSON output
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Map out an entire Python codebase (from the target script’s directory) and run the target script to capture example variable values."
     )
-    parser.add_argument("script", help="Path to the Python script to analyze and run")
-    parser.add_argument("output", help="Output JSON file for the codemap and variable examples")
+    parser.add_argument(
+        "script", help="Path to the Python script to analyze and run")
+    parser.add_argument(
+        "output", help="Output JSON file for the codemap and variable examples")
     parser.add_argument("--timeout", type=int, default=10,
                         help="Timeout in seconds before taking the snapshot (default: 10)")
     parser.add_argument("--include-source", action="store_true", default=False,
@@ -545,7 +624,8 @@ def main():
         sys.exit(1)
 
     print("Building directory code map...")
-    directory_codemap = build_directory_codemap(script_path, include_source=args.include_source)
+    directory_codemap = build_directory_codemap(
+        script_path, include_source=args.include_source)
 
     # Apply filtering to the codemap if requested.
     if args.filter_file or args.filter_name:
@@ -558,7 +638,8 @@ def main():
 
     # Apply filtering to variable examples if a name filter is provided.
     if args.filter_name:
-        variable_snapshot = filter_variable_examples(variable_snapshot, name_filters=args.filter_name)
+        variable_snapshot = filter_variable_examples(
+            variable_snapshot, name_filters=args.filter_name)
 
     output_data = {
         "codemap": directory_codemap,
@@ -571,6 +652,7 @@ def main():
         print(f"Output written to {args.output}")
     except Exception as e:
         print(f"Error writing output file: {e}")
+
 
 if __name__ == "__main__":
     main()
