@@ -421,6 +421,9 @@ def run_target_program(file_path):
     """
     Run the target Python file. (Any ProcessPoolExecutors created therein will use our patched initializer.)
     """
+    target_dir = os.path.dirname(os.path.abspath(file_path))
+    if target_dir not in sys.path:
+        sys.path.insert(0, target_dir)
     runpy.run_path(file_path, run_name="__main__")
 
 def run_with_snapshot(file_path, timeout=10):
@@ -429,6 +432,7 @@ def run_with_snapshot(file_path, timeout=10):
     and any worker processes. Then merge them into a consolidated snapshot mapping variable names to
     an example value and a list of function names where the variable appears.
     """
+    
     target_thread = threading.Thread(target=run_target_program, args=(file_path,))
     target_thread.start()
 
@@ -535,6 +539,7 @@ def main():
     args = parser.parse_args()
 
     script_path = os.path.abspath(args.script)
+
     if not os.path.exists(script_path):
         print(f"Script {script_path} does not exist.")
         sys.exit(1)
