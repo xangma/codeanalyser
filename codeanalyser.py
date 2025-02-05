@@ -31,6 +31,7 @@ import glob
 import signal
 import psutil  # pip install psutil
 import concurrent.futures
+from worker_init import process_pool_initializer
 
 # Try to import pathspec for .gitignore support. If not installed, no filtering is performed.
 try:
@@ -42,7 +43,7 @@ except ImportError:
 LIMIT = 10
 
 # Define the absolute path of this analyzer script so it can be skipped in analyses.
-SELF_PATH = os.path.abspath(__file__)
+SELF_PATH = [os.path.abspath(__file__), os.path.abspath("worker_init.py")]
 
 # =============================================================================
 # Code mapping functions
@@ -223,7 +224,7 @@ def build_directory_codemap(target_script, include_source=False):
             if file.endswith(".py"):
                 full_path = os.path.join(root, file)
                 # Skip this analyzer's own file.
-                if os.path.abspath(full_path) == SELF_PATH:
+                if os.path.abspath(full_path) in SELF_PATH:
                     print(f"Skipping self file: {full_path}")
                     continue
                 # Compute the relative path from the repository root.
@@ -335,7 +336,7 @@ def snapshot_main_process():
                 frame_file = os.path.abspath(current.f_code.co_filename)
             except Exception:
                 frame_file = None
-            if frame_file == SELF_PATH:
+            if frame_file in SELF_PATH:
                 current = current.f_back
                 continue
             func_name = current.f_code.co_name
@@ -379,7 +380,7 @@ def snapshot_signal_handler(signum, frame):
                 frame_file = os.path.abspath(current.f_code.co_filename)
             except Exception:
                 frame_file = None
-            if frame_file == SELF_PATH:
+            if frame_file in SELF_PATH:
                 current = current.f_back
                 continue
             func_name = current.f_code.co_name
@@ -417,8 +418,8 @@ def snapshot_signal_handler(signum, frame):
 OriginalProcessPoolExecutor = concurrent.futures.ProcessPoolExecutor
 
 
-def process_pool_initializer():
-    signal.signal(signal.SIGUSR1, snapshot_signal_handler)
+# def process_pool_initializer():
+#     signal.signal(signal.SIGUSR1, snapshot_signal_handler)
 
 
 class PatchedProcessPoolExecutor(OriginalProcessPoolExecutor):
@@ -433,16 +434,21 @@ concurrent.futures.ProcessPoolExecutor = PatchedProcessPoolExecutor
 
 def trigger_worker_snapshots():
     """
-    Use psutil to send SIGUSR1 to all child processes (workers).
+    Use psutil to send a signal to all child processes (workers).
     """
     current_process = psutil.Process(os.getpid())
     children = current_process.children(recursive=True)
+    # Use SIGUSR1 if available; otherwise, use SIGBREAK.
+    sig = getattr(signal, "SIGUSR1", None) or getattr(signal, "SIGBREAK", None)
+    if sig is None:
+        print("No appropriate signal available to trigger worker snapshots.")
+        return
     for child in children:
         try:
-            os.kill(child.pid, signal.SIGUSR1)
-            print(f"Sent SIGUSR1 to worker process {child.pid}")
+            os.kill(child.pid, sig)
+            print(f"Sent signal {sig} to worker process {child.pid}")
         except Exception as e:
-            print(f"Failed to send SIGUSR1 to process {child.pid}: {e}")
+            print(f"Failed to send signal to process {child.pid}: {e}")
 
 
 def collect_worker_snapshots():
@@ -484,38 +490,89 @@ def merge_snapshots(main_snapshot, worker_snapshots):
     return consolidated
 
 
-def run_target_program(file_path):
-    """
-    Run the target Python file. (Any ProcessPoolExecutors created therein will use our patched initializer.)
-    """
-    target_dir = os.path.dirname(os.path.abspath(file_path))
-    if target_dir not in sys.path:
-        sys.path.insert(0, target_dir)
-    runpy.run_path(file_path, run_name="__main__")
+def snapshot_globals(namespace):
+    user_vars = {}
+    for k, v in namespace.items():
+        if k.startswith("__") and k.endswith("__"):
+            continue
+        if isinstance(v, type(sys)):
+            continue
+        user_vars[k] = safe_snapshot_value(v)
+    return user_vars
+
+# --- Modified helper: merge globals, captured locals, and frame snapshots ---
+
+
+def merge_user_snapshots(snapshot_container):
+    globals_snapshot = snapshot_container.get('globals', {})
+    captured_snapshot = snapshot_container.get('captured', {})
+    frames_snapshot = snapshot_container.get('frames', {})
+    merged = {}
+    # Add globals; mark scope as "global"
+    for var, example in globals_snapshot.items():
+        merged[var] = {"example": example, "functions": ["global"]}
+    # Add captured locals from the main function
+    for var, value in captured_snapshot.items():
+        if var in merged:
+            merged[var]["functions"].append("main (captured)")
+        else:
+            merged[var] = {"example": safe_snapshot_value(
+                value), "functions": ["main (captured)"]}
+    # Merge in any frame-captured variables
+    for var, info in frames_snapshot.items():
+        if var in merged:
+            merged[var]["functions"] = list(
+                set(merged[var]["functions"]) | set(info["functions"]))
+        else:
+            merged[var] = info
+    return merged
+
+# ---------------------------------------------------------------------------
+# Modified: run_target_program now installs a trace function to capture local variables
+# from the target script’s main() function before it returns.
+# ---------------------------------------------------------------------------
+
+
+def run_target_program(file_path, snapshot_container):
+    captured = {}  # to hold locals from main()
+
+    def trace_func(frame, event, arg):
+        if event == "return":
+            # Check if we're returning from a function named "main" running in __main__
+            if frame.f_code.co_name == "main" and frame.f_globals.get("__name__") == "__main__":
+                # Copy the locals from main() (this should capture variables like a, b, s)
+                captured.update(frame.f_locals)
+        return trace_func
+
+    sys.settrace(trace_func)
+    try:
+        namespace = runpy.run_path(file_path, run_name="__main__")
+    finally:
+        sys.settrace(None)
+    snapshot_container['globals'] = snapshot_globals(namespace)
+    snapshot_container['captured'] = captured
+    snapshot_container['frames'] = snapshot_main_process()
 
 
 def run_with_snapshot(file_path, timeout=10):
-    """
-    Run the target program in a separate daemon thread so that if it never terminates
-    (as with a Dash server), our snapshot logic can still complete and the analyzer can exit.
-    """
-    # Set daemon=True so the thread won't block process exit.
+    snapshot_container = {}
+    # Pass snapshot_container as an argument to run_target_program
     target_thread = threading.Thread(
-        target=run_target_program, args=(file_path,), daemon=True)
+        target=run_target_program,
+        args=(file_path, snapshot_container)
+    )
     target_thread.start()
-
-    print(f"Waiting {timeout} seconds before taking a snapshot...")
-    time.sleep(timeout)
-
-    main_snapshot = snapshot_main_process()
-    print("Main process snapshot taken.")
-
+    target_thread.join(timeout)
+    if not target_thread.is_alive():
+        print("Target script finished before timeout; using early snapshot.")
+        main_snapshot = merge_user_snapshots(snapshot_container)
+    else:
+        print(
+            f"Target script did not finish within {timeout} seconds; taking snapshot now.")
+        main_snapshot = snapshot_main_process()
     trigger_worker_snapshots()
     worker_snapshots = collect_worker_snapshots()
-
     consolidated_snapshot = merge_snapshots(main_snapshot, worker_snapshots)
-
-    # No need to join the daemon thread since it won't block exit.
     return consolidated_snapshot
 
 # =============================================================================
